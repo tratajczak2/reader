@@ -8,29 +8,46 @@ import java.io.File;
 import java.io.FileReader;
 import java.sql.*;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.locks.ReentrantLock;
 import java.util.logging.*;
 
 public class LogReader {
 
     private List<String> lineQueue = new LinkedList<>();
-    private Map<String, JSONObject> lookupCache = new HashMap<>();
+    private Map<String, JSONObject> lookupCache = new ConcurrentHashMap<>();
     private List<Processor> processors = new LinkedList<>();
 
     private Logger logger;
 
     private String databaseName;
 
+    private volatile boolean threadsExit = false;
+
     public LogReader() throws Exception {
-        logger = Logger.getLogger(LogReader.class.getName());
-        Handler handler = new StreamHandler(System.out, new SimpleFormatter());
-        handler.setLevel(Level.ALL);
-        logger.setLevel(Level.ALL);
-        logger.addHandler(handler);
-        logger.log(Level.INFO, "created logger");
+        getLogger().log(Level.INFO, "created LogReader");
     }
 
-    public synchronized Logger getLogger() {
+    synchronized Logger getLogger() {
+        Logger logger = Logger.getAnonymousLogger();
+        logger.setLevel(Level.ALL);
+        Logger root = Logger.getLogger("");
+        root.setLevel(Level.ALL);
+        for (Handler h : root.getHandlers()) {
+            h.setLevel(Level.ALL);
+        }
         return logger;
+    }
+
+    /**
+     * debugging help.
+     */
+    public void reportLookupCache() {
+        synchronized (lookupCache) {
+            for (Map.Entry<String, JSONObject> ce : lookupCache.entrySet()) {
+                getLogger().log(Level.INFO, "ce:" + ce);
+            }
+        }
     }
 
     public void startProcessors() throws Exception {
@@ -50,8 +67,16 @@ public class LogReader {
     }
 
     public void stopProcessors() {
-        for (int i = 0; i < processors.size(); i++) {
-            processors.get(i).interrupt();
+        while (true) {
+            if (getLineQueueSize() == 0 && getLookupCacheSize() == 0) {
+                threadsExit = true;
+                getLogger().log(Level.INFO, "stopped all processors");
+                break;
+            } else {
+                try {
+                    Thread.sleep(500);
+                } catch (InterruptedException e) {}
+            }
         }
     }
 
@@ -85,27 +110,27 @@ public class LogReader {
         }
     }
 
+    private int getLookupCacheSize() {
+        synchronized (lookupCache) {
+            return lookupCache.size();
+        }
+    }
+
     class Processor extends Thread {
-        private boolean interrupted = false;
         private JSONParser parser;
         private Connection connection;
 
         Processor() throws Exception {
             parser = new JSONParser();
             connection = createConnection();
-            this.setDaemon(false);
         }
 
         public void run() {
-            String line = null;
-            while (!interrupted || getLineQueueSize() != 0) {
 
-                if (isInterrupted()) {
-                    interrupted = true;
-                    continue;
-                }
-                if (!interrupted || getLineQueueSize() != 0) {
+            while (!threadsExit || getLineQueueSize() != 0 || getLookupCacheSize() != 0) {
 
+                try {
+                    String line = null;
                     boolean found = false;
                     JSONObject pairObject = null;
                     JSONObject object = null;
@@ -115,37 +140,32 @@ public class LogReader {
                             line = lineQueue.remove(0);
                         }
                     }
+
                     if (line != null) {
-                        try {
-                            // parse and write to database
-                            object = (JSONObject) parser.parse(line);
-                            String id = (String) object.get("id");
+                        // parse and write to database
+                        object = (JSONObject) parser.parse(line);
+                        String id = (String) object.get("id");
 
-                            synchronized (lookupCache) {
-                                pairObject = lookupCache.get(id);
-                                if (pairObject != null) {
-                                    // we have a pair store in the database
-                                    lookupCache.remove(pairObject);
-                                    found = true;
-
-                                } else {
-                                    lookupCache.put(id, object);
-                                }
+                        synchronized (lookupCache) {
+                            pairObject = lookupCache.get(id);
+                            if (pairObject != null) {
+                                // we have a pair, store in the database
+                                lookupCache.remove(id, pairObject);
+                                found = true;
+                            } else {
+                                lookupCache.put(id, object);
                             }
-                            if (found) {
-                                storeInTheDatabase(pairObject, object);
-                            }
-                        } catch (Exception e) {
-                            getLogger().log(Level.SEVERE, "Parsing JSON failed with: " + line, e);
+                        }
+                        if (found) {
+                            storeInTheDatabase(pairObject, object);
                         }
                     } else {
-
-                        try {
-                            Thread.sleep(500);
-                        } catch (InterruptedException e) {
-                            interrupted = true;
-                        }
+                        Thread.sleep(500);
                     }
+                } catch (InterruptedException e) {
+                    getLogger().log(Level.SEVERE, " interrupted ");
+                } catch (Exception e) {
+                    getLogger().log(Level.SEVERE, "lookup or processing failed:", e);
                 }
             }
         }
@@ -153,7 +173,7 @@ public class LogReader {
         void storeInTheDatabase(JSONObject first, JSONObject second) throws Exception {
             PreparedStatement ps = null;
             try {
-                getLogger().log(Level.SEVERE, "storing in db.");
+                getLogger().log(Level.INFO, "storing in db.");
                 ps = connection.prepareCall("insert into EVENTS (id, duration, type, host, alert) values (?, ?, ?, ?, ?)");
                 ps.setString(1, (String)first.get("id"));
                 long duration = (Long)first.get("timestamp") - (Long)second.get("timestamp");
@@ -180,6 +200,7 @@ public class LogReader {
             logReader.startProcessors();
             logReader.loadFileAndProcess(new File(args[0] + "logfile.txt"));
             logReader.stopProcessors();
+            logReader.reportLookupCache();
         } catch (Exception e) {
             Logger.getGlobal().log(Level.SEVERE, "Log reader failed", e);
         }
