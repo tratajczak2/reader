@@ -100,7 +100,6 @@ public class LogReader {
             String line = null;
             while (!interrupted || getLineQueueSize() != 0) {
 
-
                 if (isInterrupted()) {
                     interrupted = true;
                     continue;
